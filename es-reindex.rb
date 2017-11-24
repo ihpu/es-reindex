@@ -16,11 +16,12 @@ and mapping copied.
 
 Usage:
 
-  #{__FILE__} [-r] [-f <frame>] [source_url/]<index> [destination_url/]<index>
+  #{__FILE__} [-r] [-f <frame>] [source_url/]<index> [destination_url/][<index>]
 
     - -r - remove the index in the new location first
     - -f - specify frame size to be obtained with one fetch during scrolling
     - -u - update existing documents (default: only create non-existing)
+    - -d - except copying source index to destination dump index source docs to file index_name.data
     - optional source/destination urls default to http://127.0.0.1:9200
 \n"
   exit 1
@@ -35,6 +36,7 @@ while ARGV[0]
   when '-r' then remove = true
   when '-f' then frame = ARGV.shift.to_i
   when '-u' then update = true
+  when '-d' then dump = true
   else
     u = arg.chomp '/'
     !src ? (src = u) : !dst ? (dst = u) :
@@ -49,15 +51,23 @@ surl, durl, sidx, didx = '', '', '', ''
     idx.replace $2
   else
     url.replace 'http://127.0.0.1:9200'
-    idx.replace param
+    idx.replace param if param
   end
 end
-printf "Copying '%s/%s' to '%s/%s'%s\n  Confirm or hit Ctrl-c to abort...\n",
-  surl, sidx, durl, didx,
-  remove ?
-    ' with rewriting destination mapping!' :
-    update ? ' with updating existing documents!' : '.'
-
+raise("Source index is not set.") if sidx.empty?
+didx = sidx if didx.empty?
+unless dump
+  printf "Copying '%s/%s' to '%s/%s'%s\n  Confirm or hit Ctrl-c to abort...\n",
+    surl, sidx, durl, didx,
+    remove ?
+      ' with rewriting destination mapping!' :
+      update ? ' with updating existing documents!' : '.'
+else
+  dfile = "#{sidx}.data"
+  printf "Copying '%s/%s' to '%s\n  Confirm or hit Ctrl-c to abort...\n",
+    surl, sidx, dfile
+  File.delete(dfile) if File.exist?(dfile)
+end
 $stdin.readline
 
 def tm_len l
@@ -187,16 +197,26 @@ while true do
     data['hits']['hits'].each do |doc|
       ### === implement possible modifications to the document
       ### === end modifications to the document
-      base = {'_index' => didx, '_id' => doc['_id'], '_type' => doc['_type']}
-      ['_timestamp', '_ttl'].each{|doc_arg|
-        base[doc_arg] = doc[doc_arg] if doc.key? doc_arg
-      }
-      bulk << Oj.dump({bulk_op => base}) + "\n"
-      bulk << Oj.dump(doc['_source']) + "\n"
+      unless dump
+        base = {'_index' => didx, '_id' => doc['_id'], '_type' => doc['_type']}
+        ['_timestamp', '_ttl'].each{|doc_arg|
+          base[doc_arg] = doc[doc_arg] if doc.key? doc_arg
+        }
+        bulk << Oj.dump({bulk_op => base}) + "\n"
+        bulk << Oj.dump(doc['_source']) + "\n"
+      else
+        bulk << Oj.dump(doc['_source']) + "\n"
+      end
       done += 1
     end
-    bulk << "\n" # empty line in the end required
-    retried_request :post, "#{durl}/_bulk", bulk
+    unless dump
+      bulk << "\n" # empty line in the end required
+      retried_request :post, "#{durl}/_bulk", bulk
+    else
+      File.open(dfile, 'a') do |f|
+        f.write(bulk)
+      end
+    end
 
     eta = total * (Time.now - t) / done
     printf "    %u/%u (%.1f%%) done in %s, E.T.A.: %s.\r",
@@ -218,7 +238,11 @@ begin
   Timeout::timeout(60) do
     while true
       scount = retried_request :get, "#{surl}/#{sidx}/_count?q=*"
-      dcount = retried_request :get, "#{durl}/#{didx}/_count?q=*"
+      unless dump
+        dcount = retried_request :get, "#{durl}/#{didx}/_count?q=*"
+      else
+        dcount = Oj.dump({'count' => File.readlines(dfile).size})
+      end
       scount = Oj.load(scount)['count'].to_i
       dcount = Oj.load(dcount)['count'].to_i
       break if scount == dcount
